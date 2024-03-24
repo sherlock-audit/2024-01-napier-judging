@@ -130,85 +130,51 @@ index 62d9562..65db5c6 100644
 
 
 
-# Issue H-2: Withdrawal can be blocked 
+**sherlock-admin3**
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/89 
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/napier-v1/pull/171.
+
+# Issue H-2: YT holder are unable to claim their interest 
+
+Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/80 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 xiaoming90
 ## Summary
 
-Malicious users can block withdrawal, preventing protocol users from withdrawing their funds.
+A malicious user could prevent YT holders from claiming their interest, leading to a loss of assets.
 
 ## Vulnerability Detail
 
-When the adaptor does not have sufficient buffer ETH, users cannot redeem their PT tokens from the Tranche. It will need to wait for the buffer to be refilled.
+The interest accrued (in target token) by a user is computed based on the following formula, where $lscale$ is the user's last scale update and $maxScale$ is the max scale observed so far. The formula is taken from [here](https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L722):
 
-https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L156
+$$
+interestAccrued = y(\frac{1}{lscale} - \frac{1}{maxScale})
+$$
 
-```solidity
-File: BaseLSTAdapter.sol
-146:     function prefundedRedeem(address recipient) external virtual returns (uint256, uint256) {
-147:         uint256 shares = balanceOf(address(this));
-148:         uint256 assets = previewRedeem(shares);
-149: 
-150:         if (shares == 0) return (0, 0);
-151:         if (assets == 0) revert ZeroAssets();
-152: 
-153:         uint256 bufferEthCache = bufferEth;
-154:         // If the buffer is insufficient, shares cannot be redeemed immediately
-155:         // Need to wait for the withdrawal to be completed and the buffer to be refilled.
-156:         if (assets > bufferEthCache) revert InsufficientBuffer();
-```
+A malicious user could perform the following steps to manipulate the $maxScale$ to a large value to prevent YT holders from claiming their interest.
 
-Let's assume the following:
+1) When the Tranche and Adaptor are deployed, immediately mint the smallest possible number of shares. Attackers can do so by calling the Adaptor's `prefundedDeposit` function directly if they want to avoid issuance fees OR call the `Tranche.issue` function
+2) Transfer large amounts of assets to the Adaptor directly. With a small amount of total supply and a large amount of total assets, the Adaptor's scale will be extremely large. Let the large scale at this point be $L$.
+3) Trigger any function that will trigger an update to the global scale. The max scale will be updated to $L$ and locked at this large scale throughout the entire lifecycle of the Tranche, as it is not possible for the scale to exceed $L$ based on the current market yield or condition.
+4) Attacker withdraws all their shares and assets via Adaptor's `prefundedDeposit` function or Tranche's redeem functions. Note that the attacker will not incur any fees during withdrawal. Thus, this attack is economically cheap and easy to execute.
+5) After the attacker's withdrawal, the current scale of the adapter will revert back to normal (e.g. 1.0 exchange rate), and the scale will only increase due to the yield from staked ETH (e.g. daily rebase) and increase progressively (e.g., 1.0 > 1.05 > 1.10 > 1.15)
 
-- `targetBufferPercentage` is set to 10%
-- current scale is 1.0
-- total assets are 90 ETH (9 ETH buffer + 81 staked ETH)
-- total supply = 90 shares
+When a user issues/mints new PT and YT, their `lscales[user]` will be set to the $maxScale$, which is $L$. 
 
-Bob (malicious user) could use the following formula to solve for "Deposit" variable OR perform off-chain simulation to determine the right number of assets to deposit for the attack:
+A user's `lscales[user]` will only be updated if the adaptor's current scale is larger than $L$. As stated earlier, it is not possible for the scale to exceed $L$ based on the current market yield or condition. Thus, the user's `lscales[user]` will be stuck at $L$ throughout the entire lifecycle of the Tranche.
 
-```solidity
-Current TotalAsset = 90 ETH
-
-(Current TotalAsset + Deposit) * 0.1 - Deposit = 0
-(90 ETH + Deposit) * 0.1 - Deposit = 0
-Deposit = 10 ETH
-```
-
-Bob deposits 10 ETH. It will become 100 ETH (10 ETH buffer + 90 staked ETH), and the total supply will increase to 100 shares. Bob will receive 10 shares in return after the deposit.
-
-Bob redeems his 10 shares, and the adaptor will send him 10 ETH, which depletes the entire amount of ETH buffer within the adaptor. Since there is no fee charged during deposit and withdraw on the adaptor, Bob will not lose any of the initial 10 ETH.
-
-```solidity
-assets = 10 shares * current scale = 10 ETH
-```
-
-Since malicious Bob has depleted the ETH buffer, the rest of the Napier users cannot withdraw.
-
-Bob will perform the above attacks within a single transaction to DOS Napier users, preventing them from withdrawing. The users can only withdraw when the rebalancer bot unstake the staked ETH to replenish the buffer. However, the issue is that in the worst-case scenario, it will take 5 days for the redemption to be processed before the adaptor can start claiming the ETH from LIDO.
-
-Following is the withdrawal period (waiting time) for unstaking ETH:
-
-- LIDO: Between 1-5 days. Note that if more people exit the staking queue in Ethereum, the waiting period will increase further.
-- FRAX: The sum total of both entry and exit queues ([Reference](https://docs.frax.finance/frax-ether/redemption#frxeth-redemption-queue))
-
-Note that the deposits by other users will not mitigate this issue due to the following reasons:
-
-- After maturity, no one can issue/mint PT+YT anymore from Tranche, resulting in no new ETH flowing into the adaptor. Yet, the attacker can directly call the Adaptor's `prefundedDeposit` and `prefundedRedeem` functions to carry out this attack as they are still accessible after maturity.
-- As time moves closer to maturity, there will be fewer deposits naturally.
+As a result, there is no way for the YT holder to claim their interest because, since $lscale == maxScale$, the interest accrued computed from the formula will always be zero. Thus, even if the Tranche/Adaptor started gaining yield from staked ETH, there is no way for YT holders to claim that.
 
 ## Impact
 
-Users are unable to withdraw. This attack is cheap to execute (gas fee would be a few bucks), but the negative consequence to the protocol is significant (e.g., block withdrawal for 5 days). To DOS Napier for a month, one could execute the attack 6 times every 5 days, and the total costs are still cheap for the attacker, short traders, or competitors (other protocols).
-
-Marking this as a High issue as the impact is High and probability is High (due to ease of execution and cheap to execute)
+YT holders cannot claim their interest, leading to a loss of assets.
 
 ## Code Snippet
 
-https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L156
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L704
 
 ## Tool used
 
@@ -216,24 +182,109 @@ Manual Review
 
 ## Recommendation
 
-Consider any of the following measures to mitigate the issues:
-
-- Charge fee upon depositing and withdrawal
-- Restrict the amount of withdrawal allowed based on the existing ETH buffer remaining on the adaptor. For instance, using the same example, if Bob has 10 shares, totalSupply is 100 shares and the current ETH buffer is 10 ETH, he should only be allowed to withdraw 1 ETH at the maximum, which is 10% of the current ETH buffer based on his portion of shares in the adaptor.
-- Restrict access to `prefundedDeposit` and `prefundedRedeem` function only to the Tranche. This does not entirely prevent this attack, but it makes the attack more expensive due to the issuance fee charged during the deposit when performed via Tranche.
+Ensure that the YT holders can continue to claim their accrued interest earned within the Tranche/Adaptor regardless of the max scale.
 
 
 
 ## Discussion
 
-**sherlock-admin**
+**nevillehuang**
 
-1 comment(s) were left on this issue during the judging contest.
+Escalate
 
-**takarez** commented:
->  valid: high(8)
+Duplicate of #92, exact same root cause, involving manipulations of maxScales
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> Duplicate of #92, exact same root cause, involving manipulations of maxScales
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**massun-onibakuchi**
+
+Escalate
+@nevillehuang  
+This issue should be lower. I think this is duplicate of #125.
+As you say,  the root cause is that scale can be manipulated, which is mainly based on a kind of inflation attack. This attack assume an attacker is able to be the first depositor to manipulate rate effectively. Also at that time, basically no one has not issued any PT/YT. Even if someone mints some PT/YT, they can redeem them by burning together (`redeemWithYt`) with minimum issuance fee loss.  This issue can be easily prevented by minting some shares earlier than a attacker in the same way as well-known inflation attack.
+
+**nevillehuang**
+
+@massun-onibakuchi In that case, I think medium severity is appropriate for this issue and #92, which should be duplicated together. 
+
+**xiaoming9090**
+
+The sponsor mentioned that the mitigation would be to mint some shares in advance to prevent the well-known inflation attack. I agree with the sponsor that this is the correct approach to fix the issue.
+
+However, the mitigation of minting some shares in advance to prevent this issue was not documented in the contest’s README. Thus, the issue remains valid and as it is, as mitigation cannot be applied retrospectively after the contest. Otherwise, it would be unfair to the Watsons to raise an issue that only gets invalid by a mitigation shared after the contest/audit.
+
+**xiaoming9090**
+
+> Escalate @nevillehuang This issue should be lower. I think this is duplicate of #125. As you say, the root cause is that scale can be manipulated, which is mainly based on a kind of inflation attack. This attack assume an attacker is able to be the first depositor to manipulate rate effectively. Also at that time, basically no one has not issued any PT/YT. Even if someone mints some PT/YT, they can redeem them by burning together (`redeemWithYt`) with minimum issuance fee loss. This issue can be easily prevented by minting some shares earlier than a attacker in the same way as well-known inflation attack.
+
+Disagree that this issue should be duplicated with Issue https://github.com/sherlock-audit/2024-01-napier-judging/issues/125.
+
+Issue https://github.com/sherlock-audit/2024-01-napier-judging/issues/125 (and its duplicate https://github.com/sherlock-audit/2024-01-napier-judging/issues/94, which has a better write-up of the issue) discusses the classic vault inflation attack. This attack exploits the rounding error and exchange rate manipulation to steal from the victim depositor. It is a well-known attack that everyone is aware of.
+
+This issue concerns manipulating the max scale by malicious users, which has prevented the YT holders from claiming their interest. This is a more complex issue and only specific to the Naiper protocol.
+
+Thus, these two are different issues, and we should be careful not to overgeneralize all issues under the same category (e.g., re-entrancy, manipulation, access control) as one single issue without considering the details.
 
 
+
+**xiaoming9090**
+
+Escalate
+
+This issue should be a High risk instead of Medium as this issue prevents YT holders from claiming their interest, leading to a loss of assets.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This issue should be a High risk instead of Medium as this issue prevents YT holders from claiming their interest, leading to a loss of assets.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**cvetanovv**
+
+First, I disagree with the sponsor that this should be Low severity and a duplicate of the #125.
+
+ As I wrote in other reports, this "inflation attack" is not documented as a known issue. 
+
+I agree with the escalations of @xiaoming9090 and @nevillehuang. This issue has the same root cause as #92 and can be duplicated as a valid High.
+
+**Czar102**
+
+After some considerations, I think duplicating this issue with #92 makes sense by claiming that both of these are sourced in the ability to manipulate the scale by donations.
+
+Please note that this doesn't mean that all "inflation attacks" are considered of the same root cause.
+
+**Czar102**
+
+Result:
+High
+Duplicate of #92
+
+Accepting only the first escalation since it was the first accurate one.
+
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [nevillehuang](https://github.com/sherlock-audit/2024-01-napier-judging/issues/80/#issuecomment-1984771258): accepted
+- [xiaoming9090](https://github.com/sherlock-audit/2024-01-napier-judging/issues/80/#issuecomment-1987104210): rejected
 
 # Issue H-3: LP Tokens always valued at 3 PTs 
 
@@ -330,57 +381,15 @@ In Napier, the AMM stores the PTs and Curve's LP tokens. When performing any ope
 
 
 
-# Issue H-4: YT holders cannot receive a portion of the principal allocated by the PT holders due to the manipulation 
+**sherlock-admin4**
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/92 
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/v1-pool/pull/159.
 
-## Found by 
-xiaoming90
-## Summary
-
-YT holders cannot receive a portion of the principal allocated by the PT holders due to the manipulation, leading to a loss of assets for the victims.
-
-## Vulnerability Detail
-
-On a sunny day, the YT holders can gain/earn more as they can receive a portion of the principal allocated by the PT holders. On the other hand, the PT holders will lose a portion of their principal during a sunny day.
-
-Malicious PT holders can ensure that the Tranche is always in a "not sunny day" state upon maturity by performing the following manipulation:
-
-1) When the Tranche and Adaptor are deployed, immediately mint the smallest possible number of shares. Attackers can do so by calling the Adaptor's `prefundedDeposit` function directly if they want to avoid issuance fees OR call the `Tranche.issue` function
-2) Transfer large amounts of assets to the Adaptor directly. With a small amount of total supply and a large amount of total assets, the Adaptor's scale will be extremely large. Let the large scale at this point be $L$.
-3) Trigger any function that will trigger an update to the global scale. The max scale will be updated to $L$ and locked at this large scale throughout the entire lifecycle of the Tranche, as it is not possible for the scale to exceed $L$ based on the current market yield or condition.
-4) Attacker withdraws all their shares and assets via Adaptor's `prefundedDeposit` function or Tranche's redeem functions. Note that the attacker will not incur any fees during withdrawal. Thus, this attack is economically cheap and easy to execute.
-5) After the attacker's withdrawal, the current scale of the adapter will revert back to normal (e.g. 1.0 exchange rate), and the scale will only increase due to the yield from staked ETH (e.g. daily rebase) and increase progressively (e.g., 1.0 > 1.05 > 1.10 > 1.15)
-
-The conditions for a sunny day are as follows, where $S(t_m)$ is the max scale and $s(t_m)$ is the maturity/current scale.
-
-$$
-\frac{s\left(t_m\right)}{S\left(t_m\right)} \geqslant 1-\theta
-$$
-
-Since the denominator ( $S(t_m)$ ) is an extremely large value ($L$), the $\frac{s\left(t_m\right)}{S\left(t_m\right)}$ component in the formula will be extremely small and always smaller than $1-\theta$. Thus, the Tranche is always in a "not sunny day" state.
-
-As a result, PT holders will prevent losing $\theta$ amount of principle to YT holders.
-
-## Impact
-
-Loss of assets for the YT holders as they cannot receive a portion of the principal allocated by the PT holders due to the manipulation.
-
-## Code Snippet
-
-https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L42
-
-## Tool used
-
-Manual Review
-
-## Recommendation
-
-Ensure that measures are in place to prevent malicious actors from manipulating the scale of the adaptor, as they impact many calculations that depend on max or maturity scales. 
-
-# Issue H-5: Victim's fund can be stolen due to rounding error and exchange rate manipulation 
+# Issue H-4: Victim's fund can be stolen due to rounding error and exchange rate manipulation 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/94 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
 Bandit, LTDingZhen, cawfree, jennifer37, xAlismx, xiaoming90
@@ -447,221 +456,195 @@ Following are some of the measures that could help to prevent such an attack:
 
 Openzeppelin's ERC4626 with a decimalsOffset=0 in the virtual share mitigates the issue, but it is recognized that it does not completely resolve it. We plan to deposit a small amount of tokens after deployment.
 
-# Issue M-1: The last user can't quit ````Tranche```` and loss fund permanently 
+**ydspa**
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/16 
+Escalate
+This finding is not high.
+This attack would be success only if the protocol team doesn't provide and keep any initial liquidity for the vault. However, in practical, we merely find protocol teams don't provide any fund to bootstrap projects. The likelihood of this attack is very low.
+
+**sherlock-admin2**
+
+> Escalate
+> This finding is not high.
+> This attack would be success only if the protocol team doesn't provide and keep any initial liquidity for the vault. However, in practical, we merely find protocol teams don't provide any fund to bootstrap projects. The likelihood of this attack is very low.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**massun-onibakuchi**
+
+> Escalate This finding is not high. This attack would be success only if the protocol team doesn't provide and keep any initial liquidity for the vault. However, in practical, we merely find protocol teams don't provide any fund to bootstrap projects. The likelihood of this attack is very low.
+
+Agree. This kind of inflation attack is not listed as a finding in the Mixbytes audit, which is still unpublished.
+
+**MehdiKarimi81**
+
+If the protocol team doesn't provide initial liquidity it would be high, since it's not listed as a known issue and the protocol team didn't clear that they plan to provide initial liquidity, it can be considered as a high severity. 
+
+**xiaoming9090**
+
+The mitigation of minting some shares in advance to prevent this issue was not documented in the contest’s README. Thus, the issue remains valid and as it is, as mitigation cannot be applied retrospectively after the contest. Otherwise, it would be unfair to the Watsons to raise an issue that only gets invalid by a mitigation shared after the contest/audit.
+
+**cvetanovv**
+
+I disagree with the escalation and this report should remain a valid High. Nowhere in the Readme or Documentation is it described that the protocol knows and can prevent this attack.
+
+**Czar102**
+
+Uncommunicated plans for issue mitigation don't constitute a reason for invalidation. I believe this was correctly judged – planning to reject the escalation and leave the issue as is.
+
+**Czar102**
+
+Result:
+High
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [ydspa](https://github.com/sherlock-audit/2024-01-napier-judging/issues/94/#issuecomment-1985343164): rejected
+
+# Issue M-1: Napier pool owner can unfairly increase protocol fees on swaps to earn more revenue 
+
+Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/51 
+
+The protocol has acknowledged this issue.
 
 ## Found by 
-KingNFT
+Solidity\_ATL\_Team\_2, xiaoming90
 ## Summary
-After maturity of ````Tranche````, all users are intended to quit and get back their fund and profit. But actually the last user might fail to quit and permanently loss fund due to rounding error in the ````Tranche.withdraw()````. With the consideration there would be many ````Tranche```` instances based on different ````adapters```` and different ````maturity````, many users would suffer this risk, and this vulnerability would be easily triggered to cause users fund loss.
+Currently there is no limit to how often a `poolOwner` can update fees which can be abused to earn more fees by charging users higher swap fees than they expect.
 
 ## Vulnerability Detail
-The issue arises on L338 of ````withdraw()```` function and L676 \~ L680 of ````_computePrincipalTokenRedeemed()````, ````principalAmount```` is rounded down in favor of users rather than the protocol, which makes no enough principal token burned . This would cause the protocol have no enough ````target```` token to burn for last user.
+The `NapierPool::setFeeParameter` function allows the `poolOwner` to set the `protocolFeePercent` at any point to a maximum value of 100%. The `poolOwner` is a trusted party but should not be able to abuse protocol settings to earn more revenue. There are no limits to how often this can be updated.
 
+## Impact
+A malicious `poolOwner` could change the protocol swap fees unfairly for users by front-running swaps and increasing fees to higher values on unsuspecting users. An example scenario is:
+
+- The `poolOwner` sets swap fees to 1% to attract users
+- The `poolOwner` front runs all swaps and changes the swap fees to the maximum value of 100%
+- After the swap the `poolOwner` resets `protocolFeePercent` to a low value to attract more users
+
+## Code Snippet
+https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/src/NapierPool.sol#L544-L556
+https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/src/libs/PoolMath.sol#L313
+
+## Tool used
+Manual Review and Foundry
+
+## Proof of concept
 ```solidity
-File: src\Tranche.sol
-328:     function withdraw(
-329:         uint256 underlyingAmount,
-330:         address to,
-331:         address from
-332:     ) external override nonReentrant expired returns (uint256) {
+ function test_protocol_owner_frontRuns_swaps_with_higher_fees() public whenMaturityNotPassed {
+        // pre-condition
+        vm.warp(maturity - 30 days);
+        deal(address(pts[0]), alice, type(uint96).max, false); // ensure alice has enough pt
+        uint256 preBaseLptSupply = tricrypto.totalSupply();
+        uint256 ptInDesired = 100 * ONE_UNDERLYING;
+        uint256 expectedBaseLptIssued = tricrypto.calc_token_amount([ptInDesired, 0, 0], true);
 
-337:         uint256 sharesRedeem = underlyingAmount.divWadDown(cscale);
-338:         uint256 principalAmount = _computePrincipalTokenRedeemed(_gscales, sharesRedeem);
-...
-343:         _burnFrom(from, principalAmount);
-...
-350:     }
-
-File: src\Tranche.sol
-668:     function _computePrincipalTokenRedeemed(
-669:         GlobalScales memory _gscales,
-670:         uint256 _shares
-671:     ) internal view returns (uint256) {
-...
-674:         if ((_gscales.mscale * MAX_BPS) / _gscales.maxscale >= oneSubTilt) {
-...
-676:             return (_shares.mulWadDown(_gscales.mscale) * MAX_BPS) / oneSubTilt;
-677:         }
-...
-680:         return _shares.mulWadDown(_gscales.maxscale);
-681:     }
-
-```
-
-The coded PoC shows more specific procedures how this would occur:
-```solidity
-
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
-
-import {TestTranche} from "./Tranche.t.sol";
-import "forge-std/console2.sol";
-
-contract TrancheRoundIssue is TestTranche {
-    address alice = address(0x011);
-    address bob = address(0x22);
-    function setUp() public virtual override {
-        super.setUp();
-    }
-
-    function testTrancheRoundIssue() public {
-        // 1. issue some PT and YT
-        deal(address(underlying), address(this), 1_000e6, true);
-        tranche.issue(address(this), 1_000e6);
-
-        // 2. alice and bob hold some YT
-        yt.transfer(alice, yt.balanceOf(address(this)) / 2);
-        yt.transfer(bob, yt.balanceOf(address(this)));
-
-        // 3. after maturity
-        vm.warp(_maturity);
-        _simulateScaleIncrease();
-
-        // 4. the withdraw() is called some times, typically causing "1" round error each time
-        for (uint256 i; i < 10; ++i) {
-            tranche.withdraw(2, address(this), address(this));
-        }
-
-        // 5. other operations such as collects, redeems and fee collection
-        tranche.redeem(tranche.balanceOf(address(this)), address(this), address(this));
-        vm.prank(management);
-        tranche.claimIssuanceFees();
-        vm.prank(alice);
-        tranche.collect();
-
-        // 6. bob becames the last unlucky guy, quit would fail
-        vm.startPrank(bob);
-        vm.expectRevert("ERC20: transfer amount exceeds balance");
-        tranche.collect();
+        // Pool owner sees swap about to occur and front runs updating fees to max value
+        vm.startPrank(owner);
+        pool.setFeeParameter("protocolFeePercent", 100);
         vm.stopPrank();
+
+        // execute
+        vm.prank(alice);
+        uint256 underlyingOut = pool.swapPtForUnderlying(
+            0, ptInDesired, recipient, abi.encode(CallbackInputType.SwapPtForUnderlying, SwapInput(underlying, pts[0]))
+        );
+        // sanity check
+        uint256 protocolFee = SwapEventsLib.getProtocolFeeFromLastSwapEvent(pool);
+        assertGt(protocolFee, 0, "fee should be charged");
     }
-}
 ```
-
-And the logs:
-```solidity
-2024-01-napier\napier-v1> forge test --match-test testTrancheRoundIssue
-[⠔] Compiling...
-[⠔] Compiling 40 files with 0.8.19
-[⠊] Solc 0.8.19 finished in 74.33sCompiler run successful!
-[⠒] Solc 0.8.19 finished in 74.33s
-
-Running 1 test for test/unit/TrancheRoundIssue.t.sol:TrancheRoundIssue
-[PASS] testTrancheRoundIssue() (gas: 1266016)
-Test result: ok. 1 passed; 0 failed; 0 skipped; finished in 13.58ms
-
-Ran 1 test suites: 1 tests passed, 0 failed, 0 skipped (1 total tests)
-```
-
-
-## Impact
-The last user would fail to quit and permanently loss fund
-
-## Code Snippet
-https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L668
-## Tool used
-
-Manual Review
 
 ## Recommendation
-```diff
-diff --git a/napier-v1/src/Tranche.sol b/napier-v1/src/Tranche.sol
-index 62d9562..457b6c5 100644
---- a/napier-v1/src/Tranche.sol
-+++ b/napier-v1/src/Tranche.sol
-@@ -673,11 +673,11 @@ contract Tranche is BaseToken, ReentrancyGuard, Pausable, ITranche {
-         // If it's a sunny day, PT holders lose `tilt` % of the principal amount.
-         if ((_gscales.mscale * MAX_BPS) / _gscales.maxscale >= oneSubTilt) {
-             // Formula: principalAmount = (shares * mscale * MAX_BPS) / oneSubTilt
--            return (_shares.mulWadDown(_gscales.mscale) * MAX_BPS) / oneSubTilt;
-+            return (_shares.mulWadUp(_gscales.mscale) * MAX_BPS) / oneSubTilt;
-         }
-         // If it's not a sunny day,
-         // Formula: principalAmount = shares * maxscale
--        return _shares.mulWadDown(_gscales.maxscale);
-+        return _shares.mulWadUp(_gscales.maxscale);
-     }
-```
+Introduce a delay in fee updates to ensure users receive the fees they expect.
 
-# Issue M-2: incorrect allowance check in NapierRouter::removeLiquidityOneUnderlying() 
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/50 
 
-## Found by 
-jennifer37
-## Summary
-incorrect allowance check in NapierRouter::removeLiquidityOneUnderlying()
+## Discussion
 
-## Vulnerability Detail
-In function removeLiquidityOneUnderlying(), we remove liquidity from pool to get underlying token and baseLpt in router. And then we will swap baseLpt to underlying in pool. So before we swap baseLpt to underlying, we need to check whether pool has enough allowance to transfer router's baseLpt token.
-```solidity
-In function removeLiquidityOneUnderlying(), before router 
-    function removeLiquidityOneUnderlying(
-        address pool,
-        uint256 index,
-        uint256 liquidity,
-        uint256 underlyingOutMin,
-        address recipient,
-        uint256 deadline
-    ) external override nonReentrant checkDeadline(deadline) returns (uint256) {
-        ...
-        // The withdrawn base LP token is exchanged for underlying in two different ways depending on the maturity.
-        // If maturity has passed, redeem else swap for underlying.
-        // 1. Swapping is used when maturity hasn't passed because redeeming is disabled before maturity.
-        // 2. Redeeming is preferred because it doesn't cause slippage.
-        if (block.timestamp < INapierPool(pool).maturity()) {
-            // Swap base LP token for underlying
-            // approve max
-    @==>if (IERC20(basePool).allowance(address(this), basePool) < baseLptOut) {
-                IERC20(basePool).forceApprove(pool, type(uint256).max);
-            }
-            uint256 removed = INapierPool(pool).swapExactBaseLpTokenForUnderlying(baseLptOut, address(this));
-            underlyingOut += removed;
-        }
-```
+**sherlock-admin**
 
-It should be 
-```solidity
-        if (block.timestamp < INapierPool(pool).maturity()) {
-            // Swap base LP token for underlying
-            // approve max
-            // (pool, not base pool)
-@==>        if (IERC20(basePool).allowance(address(this), pool) < baseLptOut) {
-                IERC20(basePool).forceApprove(pool, type(uint256).max);
-            }
-            uint256 removed = INapierPool(pool).swapExactBaseLpTokenForUnderlying(baseLptOut, address(this));
-            underlyingOut += removed;
-        }
-```
-## Impact
-Incorrect allowance check.
+1 comment(s) were left on this issue during the judging contest.
 
-## Code Snippet
-https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/src/NapierRouter.sol#L744-L752
+**takarez** commented:
+>  invalid
 
-## Tool used
 
-Manual Review
 
-## Recommendation
-change basePool to pool
-```solidity
-        if (block.timestamp < INapierPool(pool).maturity()) {
-            // Swap base LP token for underlying
-            // approve max
-   ==>    if (IERC20(basePool).allowance(address(this), pool) < baseLptOut) {
-                IERC20(basePool).forceApprove(pool, type(uint256).max);
-            }
-            uint256 removed = INapierPool(pool).swapExactBaseLpTokenForUnderlying(baseLptOut, address(this));
-            underlyingOut += removed;
-        } 
-```
+**massun-onibakuchi**
 
-# Issue M-3: YT holder are unable to claim their interest 
+we have acknowledge the issue
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/80 
+**cvetanovv**
+
+As the sponsor wrote in the other report, slippage protection can prevent a malicious increase in fees.
+
+**Darkartt**
+
+Escalate
+
+**sherlock-admin2**
+
+> Escalate
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Robert-H-Leonard**
+
+There is slippage protection in the swap but it does not fully protect against a malicious increase.
+
+The PoC in this issue can be added to the test suite in `v1-pool/test/unit/pool/Swap.t.sol` to show this increase is possible. The default protocol fee is set to 80% and this test is setting it to 100% and performing the swap.
+
+ To test an extreme case that still passes you can decrease the default protocol fee to 5% ([which is configured here ](https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/test/Base.t.sol#L112) and still have the fee increase.
+
+**Czar102**
+
+@cvetanovv can you elaborate on your stance, also given the new context?
+
+**cvetanovv**
+
+I agree with the escalation. This report and #98 should be Medium.
+
+**Czar102**
+
+Planning to apply the suggestion. Any idea why is the escalation empty? I'm not sure if I should accept it or choose [this one](https://github.com/sherlock-audit/2024-01-napier-judging/issues/98#issuecomment-1984792549) to be accepted for this single modification of the validity.
+
+**Robert-H-Leonard**
+
+@Czar102 the escalation is empty because we are working on a team of 5  and he was the only team member that could raise it. My comment below his escalation is the context of the escalation
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [Darkartt](https://github.com/sherlock-audit/2024-01-napier-judging/issues/51/#issuecomment-1984575069): accepted
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**Czar102**
+
+@Robert-H-Leonard next time please just share the escalation contents with each other to put the recommendation in the escalation. This won't be accepted in the future.
+
+# Issue M-2: Benign esfrxETH holders incur more loss than expected 
+
+Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/82 
 
 The protocol has acknowledged this issue.
 
@@ -669,37 +652,43 @@ The protocol has acknowledged this issue.
 xiaoming90
 ## Summary
 
-A malicious user could prevent YT holders from claiming their interest, leading to a loss of assets.
+Malicious esfrxETH holders can avoid "pro-rated" loss and have the remaining esfrxETH holders incur all the loss due to the fee charged by FRAX during unstaking. As a result, the rest of the esfrxETH holders incur more losses than expected compared to if malicious esfrxETH holders had not used this trick in the first place.
 
 ## Vulnerability Detail
 
-The interest accrued (in target token) by a user is computed based on the following formula, where $lscale$ is the user's last scale update and $maxScale$ is the max scale observed so far. The formula is taken from [here](https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L722):
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/frax/SFrxETHAdapter.sol#L22
 
-$$
-interestAccrued = y(\frac{1}{lscale} - \frac{1}{maxScale})
-$$
+```solidity
+File: SFrxETHAdapter.sol
+17: /// @title SFrxETHAdapter - esfrxETH
+18: /// @dev Important security note:
+19: /// 1. The vault share price (esfrxETH / WETH) increases as sfrxETH accrues staking rewards.
+20: /// However, the share price decreases when frxETH (sfrxETH) is withdrawn.
+21: /// Withdrawals are processed by the FraxEther redemption queue contract.
+22: /// Frax takes a fee at the time of withdrawal requests, which temporarily reduces the share price.
+23: /// This loss is pro-rated among all esfrxETH holders.
+24: /// As a mitigation measure, we allow only authorized rebalancers to request withdrawals.
+25: ///
+26: /// 2. This contract doesn't independently keep track of the sfrxETH balance, so it is possible
+27: /// for an attacker to directly transfer sfrxETH to this contract, increase the share price.
+28: contract SFrxETHAdapter is BaseLSTAdapter, IERC721Receiver {
+```
 
-A malicious user could perform the following steps to manipulate the $maxScale$ to a large value to prevent YT holders from claiming their interest.
+In the `SFrxETHAdapter`'s comments above, it is stated that the share price will decrease due to the fee taken by FRAX during the withdrawal request. This loss is supposed to be 'pro-rated' among all esfrxETH holders. However, this report reveals that malicious esfrxETH holders can circumvent this 'pro-rated' loss, leaving the remaining esfrxETH holders to bear the entire loss. Furthermore, the report demonstrates that the current mitigation measure, which allows only authorized rebalancers to request withdrawals, is insufficient to prevent this exploitation.
 
-1) When the Tranche and Adaptor are deployed, immediately mint the smallest possible number of shares. Attackers can do so by calling the Adaptor's `prefundedDeposit` function directly if they want to avoid issuance fees OR call the `Tranche.issue` function
-2) Transfer large amounts of assets to the Adaptor directly. With a small amount of total supply and a large amount of total assets, the Adaptor's scale will be extremely large. Let the large scale at this point be $L$.
-3) Trigger any function that will trigger an update to the global scale. The max scale will be updated to $L$ and locked at this large scale throughout the entire lifecycle of the Tranche, as it is not possible for the scale to exceed $L$ based on the current market yield or condition.
-4) Attacker withdraws all their shares and assets via Adaptor's `prefundedDeposit` function or Tranche's redeem functions. Note that the attacker will not incur any fees during withdrawal. Thus, this attack is economically cheap and easy to execute.
-5) After the attacker's withdrawal, the current scale of the adapter will revert back to normal (e.g. 1.0 exchange rate), and the scale will only increase due to the yield from staked ETH (e.g. daily rebase) and increase progressively (e.g., 1.0 > 1.05 > 1.10 > 1.15)
+Whenever a rebalancers submit a withdrawal request to withdraw staked ETH from FRAX, it will first reside in the mempool of the blockchain and anyone can see it. Malicious esfrxETH holders can front-run it to withdraw their shares from the adaptor.
 
-When a user issues/mints new PT and YT, their `lscales[user]` will be set to the $maxScale$, which is $L$. 
+When the withdrawal request TX is executed, the remaining esfrxETH holders in the adaptor will incur the fee. Once executed, the malicious esfrxETH deposits back to the adaptors.
 
-A user's `lscales[user]` will only be updated if the adaptor's current scale is larger than $L$. As stated earlier, it is not possible for the scale to exceed $L$ based on the current market yield or condition. Thus, the user's `lscales[user]` will be stuck at $L$ throughout the entire lifecycle of the Tranche.
-
-As a result, there is no way for the YT holder to claim their interest because, since $lscale == maxScale$, the interest accrued computed from the formula will always be zero. Thus, even if the Tranche/Adaptor started gaining yield from staked ETH, there is no way for YT holders to claim that.
+Note that no fee is charged to the users for any deposit or withdrawal operation. Thus, as long as the gain from this action is more than the gas cost, it makes sense for the esfrxETH holders to do so.
 
 ## Impact
 
-YT holders cannot claim their interest, leading to a loss of assets.
+The rest of the esfrxETH holders incur more losses than expected compared to if malicious esfrxETH holders had not used this trick in the first place.
 
 ## Code Snippet
 
-https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L704
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/frax/SFrxETHAdapter.sol#L22
 
 ## Tool used
 
@@ -707,9 +696,65 @@ Manual Review
 
 ## Recommendation
 
-Ensure that the YT holders can continue to claim their accrued interest earned within the Tranche/Adaptor regardless of the max scale.
+The best way to discourage users from withdrawing their assets and depositing them back to take advantage of a particular event is to impose a fee upon depositing and withdrawing. 
 
-# Issue M-4: Anyone can convert someone's unclaimed yield to PT + YT 
+
+
+## Discussion
+
+**massun-onibakuchi**
+
+We'll submit transactions using private rpc like flashbot.
+
+
+**xiaoming9090**
+
+Escalate.
+
+Agree with the sponsor that this attack would be prevented if the withdraw request transaction is submitted via private RPC like flash-bot.
+
+However, this attack and its mitigation (using a private RPC) were not highlighted as a known issue under the contest’s README.
+
+Thus, this issue should be considered valid and not excluded, as the mitigation measures are shared post-audit.
+
+**sherlock-admin2**
+
+> Escalate.
+> 
+> Agree with the sponsor that this attack would be prevented if the withdraw request transaction is submitted via private RPC like flash-bot.
+> 
+> However, this attack and its mitigation (using a private RPC) were not highlighted as a known issue under the contest’s README.
+> 
+> Thus, this issue should be considered valid and not excluded, as the mitigation measures are shared post-audit.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**cvetanovv**
+
+I think @xiaoming9090 is right here. Nowhere is it described that private rpc like flashbot will be used. So in my opinion it can be valid Medium.
+
+**Czar102**
+
+Planning to accept the escalation and make the issue a valid Medium.
+
+**Czar102**
+
+Result:
+Medium
+Unique
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [xiaoming9090](https://github.com/sherlock-audit/2024-01-napier-judging/issues/82/#issuecomment-1987103039): accepted
+
+# Issue M-3: Anyone can convert someone's unclaimed yield to PT + YT 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/83 
 
@@ -792,7 +837,11 @@ Consider not allowing anyone to issue PY+YT on behalf of someone's account.
 
 
 
-# Issue M-5: Lack of slippage control for `issue` function 
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/napier-v1/pull/178.
+
+# Issue M-4: Lack of slippage control for `issue` function 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/84 
 
@@ -874,7 +923,11 @@ Implement a slippage control that allows the users to revert if the amount of PT
 
 
 
-# Issue M-6: Users unable to withdraw their funds due to FRAX admin action 
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/v1-pool/pull/157.
+
+# Issue M-5: Users unable to withdraw their funds due to FRAX admin action 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/95 
 
@@ -983,12 +1036,12 @@ Ensure that the protocol team and its users are aware of the risks of such an ev
 
 
 
-# Issue M-7: `withdraw` function does not comply with ERC5095 
+# Issue M-6: `withdraw` function does not comply with ERC5095 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/96 
 
 ## Found by 
-0xVolodya, Bandit, jennifer37, xiaoming90
+0xVolodya, xiaoming90
 ## Summary
 
 The `withdraw` function of Tranche/PT does not comply with ERC5095 as it does not return the exact amount of underlying assets requested by the users.
@@ -1063,9 +1116,85 @@ Update the `withdraw` function to send exactly `underlyingAmount` number of unde
 
 
 
-# Issue M-8: AMM will revert if exchange rate is one 
+**sherlock-admin3**
 
-Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/100 
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/napier-v1/pull/170.
+
+**massun-onibakuchi**
+
+@nevillehuang I think this finding severity can be much lower. Actually EIP5095 is stagnant not even final status, which means it could be changed. we have not known protocols which uses this standard.
+
+https://eips.ethereum.org/
+
+**Banditx0x**
+
+Escalate
+
+This is low/informational. Zero impact, does not break core functionality, or any functionality for that matter.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> This is low/informational. Zero impact, does not break core functionality, or any functionality for that matter.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**nevillehuang**
+
+@Banditx0x Seems to be right according to this sherlock rule:
+
+> EIP Compliance: For issues related to EIP compliance, the protocol & codebase must show that there are important external integrations that would require strong compliance with the EIP's implemented in the code. The EIP must be in regular use or in the final state for EIP implementation issues to be considered valid
+
+**xiaoming9090**
+
+Per the contest's [README](https://github.com/sherlock-audit/2024-01-napier/tree/main?tab=readme-ov-file#q-is-the-codecontract-expected-to-comply-with-any-eips-are-there-specific-assumptions-around-adhering-to-those-eips-that-watsons-should-be-aware-of) page, the protocol **explicitly** states that the code is expected to comply with ERC5095 (https://eips.ethereum.org/EIPS/eip-5095). Thus, any non-compliance to ERC5095 found by the Watsons during the contest is considered a valid Medium. 
+
+Otherwise, it would be unfair to all the Watson who made an effort to verify if the contracts comply with ERC5095.
+
+> Q: Is the code/contract expected to comply with any EIPs? Are there specific assumptions around adhering to those EIPs that Watsons should be aware of?
+> EIP20 and IERC5095
+
+Note that the Hierarchy of truth in Sherlock's contest, "Contest README", precedes everything else, including "Sherlock rules for valid issues"
+
+> Hierarchy of truth: Contest README > Sherlock rules for valid issues > protocol documentation (including code comments) > protocol answers on the contest public Discord channel.
+
+**Banditx0x**
+
+There are plenty of informational/low issues that don't get rewarded. The mention of an EIP in the ReadMe does not automatically boost an issue to Medium.
+
+**cvetanovv**
+
+For me, this issue is borderline medium/low. In the past, such reports have been Medium, but I also agree with @Banditx0x comment that this is more like Low severity. 
+
+**Czar102**
+
+I am inclined to leave the issue as is, but will consult team members before sharing a preliminary verdict.
+
+**Czar102**
+
+After discussing this, I'm planning to reject the escalation and leave the issue as is. It will be made more explicit in the rules that issues about mentioned EIPs are valid.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [banditx0x](https://github.com/sherlock-audit/2024-01-napier-judging/issues/96/#issuecomment-1986572758): rejected
+
+# Issue M-7: Users are unable to collect their yield if tranche is paused 
+
+Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/97 
 
 The protocol has acknowledged this issue.
 
@@ -1073,48 +1202,53 @@ The protocol has acknowledged this issue.
 xiaoming90
 ## Summary
 
-The AMM will stop working unexpectedly when the `preTradeExchangeRate` is 1.0.
+Users are unable to collect their yield if Tranche is paused, resulting in a loss of assets for the victims.
 
 ## Vulnerability Detail
 
-https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/src/libs/PoolMath.sol#L213
+Per the contest's README page, it stated that the admin/owner is "RESTRICTED". Thus, any finding showing that the owner/admin can steal a user's funds, cause loss of funds or harm to the users, or cause the user's fund to be struck is valid in this audit contest.
+
+> Q: Is the admin/owner of the protocol/contracts TRUSTED or RESTRICTED?
+>
+> RESTRICTED
+
+The admin of the protocol has the ability to pause the Tranche contract, and no one except for the admin can unpause it. If a malicious admin paused the Tranche contract, the users will not be able to collect their yield earned, leading to a loss of assets for them.
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L605
 
 ```solidity
-File: PoolMath.sol
-203:     function _getRateAnchor(
-204:         uint256 totalBaseLptTimesN,
-205:         uint256 lastLnImpliedRate,
-206:         uint256 totalUnderlying18,
-207:         int256 rateScalar,
-208:         uint256 timeToExpiry
-209:     ) internal pure returns (int256 rateAnchor) {
-210:         // `extRate(t*) = e^(lastLnImpliedRate * yearsToExpiry(t))`
-211:         // Get pre-trade exchange rate with zero-fee
-212:         int256 preTradeExchangeRate = _getExchangeRateFromImpliedRate(lastLnImpliedRate, timeToExpiry);
-..SNIP..
-213:         // exchangeRate should not be below 1.
-214:         // But it is mathematically almost impossible to happen because `exp(x) < 1` is satisfied for all `x < 0`.
-215:         // Here x = lastLnImpliedRate * yearsToExpiry(t), which is very unlikely to be negative.(or
-216:         // more accurately the natural log rounds down to zero). `lastLnImpliedRate` is guaranteed to be positive when it is set
-217:         // and `yearsToExpiry(t)` is guaranteed to be positive because swap can only happen before maturity.
-218:         // We still check for this case to be safe.
-219:         require(preTradeExchangeRate > SignedMath.WAD);
-220:         uint256 proportion = totalBaseLptTimesN.divWadDown(totalBaseLptTimesN + totalUnderlying18);
-221:         int256 lnProportion = _logProportion(proportion);
-222: 
-223:         // Compute `rateAnchor(t) = extRate(t*) - ln(portion(t*)) / rateScalar(t)`
-224:         rateAnchor = preTradeExchangeRate - lnProportion.divWadDown(rateScalar);
+File: Tranche.sol
+603:     /// @notice Pause issue, collect and updateUnclaimedYield
+604:     /// @dev only callable by management
+605:     function pause() external onlyManagement {
+606:         _pause();
+607:     }
+608: 
+609:     /// @notice Unpause issue, collect and updateUnclaimedYield
+610:     /// @dev only callable by management
+611:     function unpause() external onlyManagement {
+612:         _unpause();
+613:     }
 ```
 
-At Line 219, it requires that the `preTradeExchangeRate` be larger than 1.0. However, technically, the exchange rate can be 1.0 based on the comment in Line 213 that the exchange rate should not be below one, which means that the exchange rate should be 1.0 or above. Thus, when the `preTradeExchangeRate` is 1.0, the AMM will revert unexpectedly.
+The following shows that the `collect` function can only be executed when the system is not paused.
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L399
+
+```solidity
+File: Tranche.sol
+399:     function collect() public nonReentrant whenNotPaused returns (uint256) {
+400:         uint256 _lscale = lscales[msg.sender];
+401:         uint256 accruedInTarget = unclaimedYields[msg.sender];
+```
 
 ## Impact
 
-The AMM might stop working unexpectedly. Breaking of core protocol/contract functionality.
+Users are unable to collect their yield if Tranche is paused, resulting in a loss of assets for the victims.
 
 ## Code Snippet
 
-https://github.com/sherlock-audit/2024-01-napier/blob/main/v1-pool/src/libs/PoolMath.sol#L213
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/Tranche.sol#L605
 
 ## Tool used
 
@@ -1122,22 +1256,256 @@ Manual Review
 
 ## Recommendation
 
-Consider making the following change:
+Consider allowing the users to collect yield even when the system is paused.
 
-```diff
-function _getRateAnchor(
-    uint256 totalBaseLptTimesN,
-    uint256 lastLnImpliedRate,
-    uint256 totalUnderlying18,
-    int256 rateScalar,
-    uint256 timeToExpiry
-) internal pure returns (int256 rateAnchor) {
-	..SNIP..
--    require(preTradeExchangeRate > SignedMath.WAD);
-+    require(preTradeExchangeRate >= SignedMath.WAD);
+
+
+## Discussion
+
+**nevillehuang**
+
+Escalate
+
+As mentioned by the watson, any issue that can causes a possible DoS/loss of funds by protocols admin not arising from external contract pauses/emergency withdrawals should be a valid medium severity issues due to centralization risks. In this case, protocol admins can block collection of yield permanently. In fact, it also blocks reinvestment of yield via `issue()`
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> As mentioned by the watson, any issue that can causes a possible DoS/loss of funds by protocols admin not arising from external contract pauses/emergency withdrawals should be a valid medium severity issues due to centralization risks. In this case, protocol admins can block collection of yield permanently. In fact, it also blocks reinvestment of yield via `issue()`
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**xiaoming9090**
+
+Agree with the escalation by Nevi. The report highlighted a way for the admin to pause the contract, resulting in the users not being able to collect their yield earned, leading to a loss of assets for them. Per the contest rules, such an issue is considered valid.
+
+> Q: Is the admin/owner of the protocol/contracts TRUSTED or RESTRICTED?
+>
+> RESTRICTED
+
+
+
+**cvetanovv**
+
+The reason I left it invalid is that I consider the pausing mechanism a design decision. 
+
+Also, they have written in the readme that it is acceptable to have contracts pausing. Yes, I know this applies to External integrations, but I think it may be valid for them as well. 
+
+Apart from that pausing only stops users from collecting their rewards, doesn't mean the protocol will steal them. We have a sentence in the rules that gives the judge in this situation some flexibility to decide: "Please note that these restrictions must be explicitly described by the protocol and will be considered case by case."
+
+**xiaoming9090**
+
+> The reason I left it invalid is that I consider the pausing mechanism a design decision.
+> 
+> Also, they have written in the readme that it is acceptable to have contracts pausing. Yes, I know this applies to External integrations, but I think it may be valid for them as well.
+> 
+> Apart from that pausing only stops users from collecting their rewards, doesn't mean the protocol will steal them. We have a sentence in the rules that gives the judge in this situation some flexibility to decide: "Please note that these restrictions must be explicitly described by the protocol and will be considered case by case."
+
+I agree that having a pausing mechanism is a design choice by the protocol team. However, that does not mean the malicious admin will not use this pausing mechanism to block users from collecting their yields, causing harm to them.
+
+The contest's README stated that pausing by external protocols is fine, but that does not mean that internal pausing is out-of-scope during the contest.
+
+When users cannot collect their earned yield due to malicious admin activities, it is basically the same as a loss of assets for them. Loss of assets for either users or protocols is considered a valid issue here.
+
+Note: Admin is restricted in this contest.
+
+
+
+**Czar102**
+
+I agree that this is a Medium severity issue, planning to accept the escalation. It is clear that when the protocol team considers the admins "RESTRICTED" and doesn't post the restrictions, the owners should not be able to cause losses to users.
+
+@cvetanovv
+The pausing mechanism is a design decision, but when it starts to allow to cause loss of funds by an untrusted actor, then it becomes a vulnerability, too.
+They are fine with external integration pausing, meaning that they trust the protocols to do it with the good of users in mind. This has an odd relation with the fact that external admins are restricted, but luckily we are not considering external admins here.
+
+**Czar102**
+
+Result:
+Medium
+Unique
+
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [nevillehuang](https://github.com/sherlock-audit/2024-01-napier-judging/issues/97/#issuecomment-1984824534): accepted
+
+# Issue M-8: Permissioned rebalancing functions leading to loss of assets 
+
+Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/99 
+
+The protocol has acknowledged this issue.
+
+## Found by 
+Arabadzhiev, ZanyBonzy, cawfree, thisvishalsingh, xiaoming90
+## Summary
+
+Permissioned rebalancing functions that could only be accessed by admin could lead to a loss of assets.
+
+## Vulnerability Detail
+
+Per the contest's README page, it stated that the admin/owner is "RESTRICTED". Thus, any finding showing that the owner/admin can steal a user's funds, cause loss of funds or harm to the users, or cause the user's fund to be struck is valid in this audit contest.
+
+> Q: Is the admin/owner of the protocol/contracts TRUSTED or RESTRICTED?
+>
+> RESTRICTED
+
+The following describes a way where the admin can block users from withdrawing their assets from the protocol
+
+1. The admin calls the `setRebalancer` function to set the rebalance to a wallet address owned by them.
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L245
+
+```solidity
+File: BaseLSTAdapter.sol
+245:     function setRebalancer(address _rebalancer) external onlyOwner {
+246:         rebalancer = _rebalancer;
+247:     }
 ```
 
-Sidenote: This is also implemented in [Pendle's Math Library](https://github.com/pendle-finance/pendle-core-v2-public/blob/2de25376697d077629f28f5d2fc165582f565aac/contracts/libraries/math/MarketMathCore.sol#L251)
+2. The admin calls the `setTargetBufferPercentage` the set the `targetBufferPercentage` to the smallest possible value of 1%. This will cause only 1% of the total ETH deposited by all the users to reside on the adaptor contract. This will cause the ETH buffer to deplete quickly and cause all the redemption and withdrawal to revert.
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L251
+
+```solidity
+File: BaseLSTAdapter.sol
+251:     function setTargetBufferPercentage(uint256 _targetBufferPercentage) external onlyRebalancer {
+252:         if (_targetBufferPercentage < MIN_BUFFER_PERCENTAGE || _targetBufferPercentage > BUFFER_PERCENTAGE_PRECISION) {
+253:             revert InvalidBufferPercentage();
+254:         }
+255:         targetBufferPercentage = _targetBufferPercentage;
+256:     }
+```
+
+3. The owner calls the `setRebalancer` function again and sets the rebalancer address to `address(0)`. As such, no one has the ability to call functions that are only accessible by rebalancer. The `requestWithdrawal` and `requestWithdrawalAll` functions are only accessible by rebalancer. Thus, no one can call these two functions to replenish the ETH buffer in the adaptor contract.
+4. When this state is reached, users can no longer withdraw their assets from the protocol, and their assets are stuck in the contract. This effectively causes them to lose their assets.
+
+## Impact
+
+Loss of assets for the victim.
+
+## Code Snippet
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L245
+
+https://github.com/sherlock-audit/2024-01-napier/blob/main/napier-v1/src/adapters/BaseLSTAdapter.sol#L251
+
+## Tool used
+
+Manual Review
+
+## Recommendation
+
+To prevent the above scenario, the minimum `targetBufferPercentage` should be set to a higher percentage such as 5 or 10%, and the `requestWithdrawal` function should be made permissionless, so that even if the rebalancer does not do its job, anyone else can still initiate the rebalancing process to replenish the adaptor's ETH buffer for user's withdrawal.
+
+
+
+## Discussion
+
+**sherlock-admin**
+
+1 comment(s) were left on this issue during the judging contest.
+
+**takarez** commented:
+>  invalid
+
+
+
+**massun-onibakuchi**
+
+We are aware of such issues. The owner account is set to governance or multisig. To prevent the target buffer from becoming too low, it is set to 10% by default. This value can be changed even after deployment. Additionally, executing rebalancing functions may reduce the scale of the adapter. Making such functions callable by anyone would, conversely, become a vulnerability. Considering this trade-off, we chose to make it a permissioned function.
+
+**nevillehuang**
+
+Escalate
+
+Unsure why this issue was excluded. The issue is highlighting how a potentially malicious protocol admin can cause a permanent DoS on users for core functionalities such as redemptions and withdrawals. Given protocol admins are explicitly mentioned as restricted in the contest details, I believe this issue should be valid medium severity.
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> Unsure why this issue was excluded. The issue is highlighting how a potentially malicious protocol admin can cause a permanent DoS on users for core functionalities such as redemptions and withdrawals. Given protocol admins are explicitly mentioned as restricted in the contest details, I believe this issue should be valid medium severity.
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**xiaoming9090**
+
+Agree with Nevi. This report and its duplicates highlighted that it is possible for a malicious admin to negatively impact the users. Thus, it should be valid as per Sherlock's contest rules as admin is "restricted" in the contest's README.
+
+**ABDuullahi**
+
+This should stay invalid i believe, the README says `Rebalancer: An account can manage adapter and request withdrawal for liquid staking tokens. It can't steal funds.` and this issue does not describe a situation where the role can steal funds.
+
+**xiaoming9090**
+
+> 4\. users can no longer withdraw their assets from the protocol, and their assets are stuck in the contract
+
+The ability for the malicious admin (with rebalancer role) to cause users to be unable to withdraw their assets from the protocol, and in turn lead to their assets being stuck, is sufficient for this issue to be valid.
+
+**cvetanovv**
+
+I disagree with the escalation. 
+The reason the report is not valid is the first comment from the sponsor. As we can see this is a design decision. 
+Other than that, one of the recommendations is that `targetBufferPercentage` should be higher. But this is a configuration value that can be changed. So I think the report should remain Low/Invalid.
+
+**xiaoming9090**
+
+> I disagree with the escalation. The reason the report is not valid is the first comment from the sponsor. As we can see this is a design decision. Other than that, one of the recommendations is that `targetBufferPercentage` should be higher. But this is a configuration value that can be changed. So I think the report should remain Low/Invalid.
+
+A malicious admin can set the `targetBufferPercentage` is configured to the lowest possible value, and then calls the `setRebalancer` function again and sets the rebalancer address to address(0). As such, no one has the ability to call functions that are only accessible by rebalancer. The `requestWithdrawal` and `requestWithdrawalAll` functions are only accessible by rebalancer. Thus, no one can call these two functions to replenish the ETH buffer in the adaptor contract.
+
+When the ETH buffer is not replenished, no one can withdraw from the protocol. This is sufficient to show that it is possible for malicious admins to harm users by preventing them from withdrawing. Note that the admin is restricted in this contest.
+
+**ABDuullahi**
+
+I think sherlock rules stated that the restriction must be explicitly mentioned, and for this role, its that `it cant steal funds`, not to disrupt the claiming/withdrawal process
+
+**nevillehuang**
+
+@ABDuullahi This issue is initiated by the admin (owner of contracts), not the rebalancer.
+
+**Czar102**
+
+> This issue is initiated by the admin (owner of contracts), not the rebalancer.
+
+@nevillehuang is the rebalancer relevant to this issue at all?
+
+If not, I am planning to consider this a Medium severity issue and accept the escalation, with similar reasons to the ones listed here: https://github.com/sherlock-audit/2024-01-napier-judging/issues/97#issuecomment-1997410230.
+
+**nevillehuang**
+
+@Czar102 Not relevant, the admin can set the rebalancer to an address they control and/or themselves and execute the DoS
+
+**Czar102**
+
+@nevillehuang @cvetanovv is this a correct and full list of duplicates?
+#11, #21, #26, #119
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [nevillehuang](https://github.com/sherlock-audit/2024-01-napier-judging/issues/99/#issuecomment-1984813068): accepted
 
 # Issue M-9: `swapUnderlyingForYt` revert due to rounding issues 
 
@@ -1296,6 +1664,10 @@ Thus, it is recommended that a round-up division be performed when computing the
 >  valid: rounding error: medium(7)
 
 
+
+**sherlock-admin4**
+
+The protocol team fixed this issue in PR/commit https://github.com/napierfi/v1-pool/pull/158.
 
 # Issue M-10: Unable to deposit to Tranche/Adaptor under certain conditions 
 
@@ -1627,6 +1999,292 @@ And then use it in the `NapierRouter::_verifyCallback` function in place of the 
     }
 ```
 
+
+
+## Discussion
+
+**sherlock-admin4**
+
+> Escalate
+> 
+> Invalid. Both the mentioned report requires only 2^80 computation to find a collision hash because of the birthday paradox. In this issue, the attacker needs approx 2^160 computation to find the exact match with the specific napier pool deployed.
+
+You've deleted an escalation for this issue.
+
+**Arabadzhiew**
+
+> Escalate
+> 
+> Invalid. Both the mentioned report requires only 2^80 computation to find a collision hash because of the birthday paradox. In this issue, the attacker needs approx 2^160 computation to find the exact match with the specific napier pool deployed.
+
+How exactly did you come to that conclusion? The goal of this exploit is not to find a match with a specific Napier pool, but instead a match with an EOA controlled by the attacker. The case is the same in the mentioned report. If anything, in the case of the `NapierRouter` the collision would be theoretically more likely to happen, since here we have two address arguments (320 bits) that can be played with when trying to find а collision, while in the Kyberswap issue there is an address + uint24 (184 bits).
+
+**Coareal**
+
+ > How exactly did you come to that conclusion? The goal of this exploit is not to find a match with a specific Napier pool, but instead a match with an EOA controlled by the attacker. The case is the same in the mentioned report. If anything, in the case of the `NapierRouter` the collision would be theoretically more likely to happen, since here we have two address arguments (320 bits) that can be played with when trying to find а collision, while in the Kyberswap issue there is an address + uint24 (184 bits).
+
+Removed escalation. Agree that issue is similar to Kyberswap's.
+
+**nevillehuang**
+
+Escalate
+
+How would the allowances be stolen here? Wouldn’t a user be only approving specified PT amounts wherein every swap will consume the approval, thus making this attack not profitable?
+
+Additionally, This issue seems to lack a further description/explanation of the attack vector specific to napier as opposed to the linked issue:
+
+> token0 can be constant and we can achieve the variation in the hash by changing token1. The attacker could use token0 = WETH and vary token1. This would allow them to steal all allowances of WETH.
+
+Perhaps the watsons @Arabadzhiew @xiaoming9090 can clarify better
+
+**sherlock-admin2**
+
+> Escalate
+> 
+> How would the allowances be stolen here? Wouldn’t a user be only approving specified PT amounts wherein every swap will consume the approval, thus making this attack not profitable?
+> 
+> Additionally, This issue seems to lack a further description/explanation of the attack vector specific to napier as opposed to the linked issue:
+> 
+> > token0 can be constant and we can achieve the variation in the hash by changing token1. The attacker could use token0 = WETH and vary token1. This would allow them to steal all allowances of WETH.
+> 
+> Perhaps the watsons @Arabadzhiew @xiaoming9090 can clarify better
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Arabadzhiew**
+
+> Escalate
+> 
+> How would the allowances be stolen here? Wouldn’t a user be only approving specified PT amounts wherein every swap will consume the approval, thus making this attack not profitable?
+> 
+> Additionally, This issue seems to lack a further description/explanation of the attack vector specific to napier as opposed to the linked issue:
+> 
+> > token0 can be constant and we can achieve the variation in the hash by changing token1. The attacker could use token0 = WETH and vary token1. This would allow them to steal all allowances of WETH.
+> 
+> Perhaps the watsons @Arabadzhiew @xiaoming9090 can clarify better
+
+Most of the users that will perform more than 1 swap with a specific token using the router will simply give max approval to it. This is because:
+1. It saves gas by not having to make a separate approve call for each swap;
+2. By default, this is what you are prompted to do by Metamask when you are required to give token allowance to some dapp;
+
+Additionally, I have only given a high level overview of the issue, since it is very similar to the one reported in the Kyberswap contest, and I thought that a more in-depth explanation would simply be redundant. But since you are asking about it, I'm going  to provide a short explanation on one of the ways of how this vulnerability can be exploited in the context of Napier:
+
+Taking the `NapierRouter::swapCallback` function:
+
+```solidity
+    function swapCallback(int256 underlyingDelta, int256 ptDelta, bytes calldata data) external override {
+        // `data` is encoded as follows:
+        // [0x00: 0x20] CallbackType (uint8)
+        // [0x20: 0x40] Underlying (address)
+        // [0x40: 0x60] BasePool (address)
+        // [0x60:  ~  ] Custom data (based on CallbackType)
+        (address underlying, address basePool) = abi.decode(data[0x20:0x60], (address, address));
+        _verifyCallback(basePool, underlying);
+
+        CallbackType _type = CallbackDataTypes.getCallbackType(data);
+
+        if (_type == CallbackType.SwapPtForUnderlying) {
+            CallbackDataTypes.SwapPtForUnderlyingData memory params =
+                abi.decode(data[0x60:], (CallbackDataTypes.SwapPtForUnderlyingData));
+            params.pt.safeTransferFrom(params.payer, msg.sender, uint256(-ptDelta));
+        ...
+    }
+```
+
+As it can be seen in this snippet, the `basePool` and `underlying` values are only used for the pool address verification. Furthermore, we can see that in the first `if` block of the function there is a single `safeTransferFrom` call that sends a concrete **amount** of a concrete **token** from a concrete **address** to the  `msg.sender`. All the values in bold are passed in as function arguments and are not used for the CREATE2 pool address computation. What we can conclude from this is that if someone manages to find a combination of `basePool` and `underlying` that passes the `_verifyCallback` check for their EOA, then they can easily steal all of the token allowances given to the router contract.   
+
+**0xMR0**
+
+`msg.sender` is already being validated as napier pool address.
+
+```solidity
+    /// @dev Revert if `msg.sender` is not a Napier pool.
+    function _verifyCallback(address basePool, address underlying) internal view {
+        if (
+            PoolAddress.computeAddress(basePool, underlying, POOL_CREATION_HASH, address(factory))
+                != INapierPool(msg.sender)
+        ) revert Errors.RouterCallbackNotNapierPool();
+    }
+```
+
+It would revert for non-existent napier pool address. How the recommendation is different from the above check?
+
+**Arabadzhiew**
+
+@0xMR0 Quoting what is stated in my report:
+
+>However, this method of verifying the caller address is collision prone, as the computation of the Create2 address is done by truncating a 256 bit keccak256 hash to 160 bits, meaning that for each address there are 2^96 possible hashes that will result in it after being truncated. Furthermore, what this means is that if a basePool and underlying combination that results in an address controlled by a malicious user is found, all token allowances given to the NapierRouter contract can be stolen.
+
+Additionally, the recommendation is different from the current approach of verification in that, it will verify whether the `msg.sender` is a legit Nepier pool by checking that it was deployed by the `PoolFactory` rather than comparing it to a computed Create2 address, which is collision prone.
+
+Please read the full report and the resources attached to it in order to gain a deeper understanding of the vulnerability in question. 
+
+
+**massun-onibakuchi**
+
+I think CREATE2 with Factory pattern can be found in well-known UniswapV3, and I believe Uniswap v3 don't need to fix it because the issue seems to be mostly impossible to happen in reality. Therefore, this issue should be considered as a low or non-issue.
+References:
+https://github.com/Uniswap/v3-periphery/blob/main/contracts/SwapRouter.sol#L65
+https://github.com/Uniswap/v3-periphery/blob/main/contracts/libraries/CallbackValidation.sol#L21
+
+Also, the attack cost makes a strong external condition, which requires a very big upfront cost with no certainty on pay out as attacker.
+
+**nevillehuang**
+
+To keep consistency of results, I think this issue should remain valid, but I am keeping my escalation up for @Czar102 to revisit this type of issues. I believe based on sponsor comments [here](https://github.com/sherlock-audit/2024-01-napier-judging/issues/111#issuecomment-1986784248) and the assumption that all users make max approvals towards the router, this type of issues should have a better sherlock rule catering to this and/or make known to sponsors to be aware as a known accepted risk.
+
+**Arabadzhiew**
+
+The reason why such a vulnerability has not been exploited in the wild yet is that as @massun-onibakuchi mentioned, the attack requires a big upfront cost as of today. However, given the fact that `NapierRouter` is an immutable contract and taking into consideration the rapid advancement of computing capabilities (the Bitcoin hashrate alone has almost doubled since the Kyberswap issue was reported - it has raised from 4.71e20 to 7.68e20), we can see how this exploit might become much more profitable and very realistically feasible in the not so distant future. And as of now, the Sherlock rulebook does not have a fixed timeline within which an issue must occur, in order for it to be considered valid.
+
+Also, the allowances that are going to be given to the contract are not an assumption, but rather a "fact of life" for such kind of contracts. Pretty much all DEX router contracts have token allowances in the magnitudes of millions of dollars. And that is because understandably, nobody wants to pay extra gas fees when possible.
+
+On a final note, in the particular case of the `NapierRouter` **all** token allowances given to it can be stolen with a single address collision, while in the case of the Kyberswap issue, a separate collision has to be found for each token. That is because the CREATE2 addresses of the Napier pools are not computed based on all token addresses used within them.
+
+I will refrain from commenting on this issue any further. I believe that enough has been said in order for the Head of Judging to be able to make an informed decision.
+
+
+
+
+**xiaoming9090**
+
+A note to the judges. The risk profile of this issue is the same as the Arcadia's Contest (https://github.com/sherlock-audit/2023-12-arcadia-judging/issues/59). Thus, the risk rating of this issue should be aligned for consistency. Thanks.
+
+**cvetanovv**
+
+This issue should remain Medium. The report is similar to the Arcadia contest from a few weeks ago. It wouldn't be fair for it to be Low here. However, I suggest that Sherlock include it in the documentation as a known issue in the future.
+
+**Czar102**
+
+To exploit this, an attacker would need to find a collision between an owned address and a potentially deployed pool (if there is less than 10^12 pools deployed then the attack is definitely unfeasible). So, the attacker needs to make the owner deploy a pool. The attacker needs to be the owner.
+
+The issue by itself is a borderline Med/Low, so I believe, considering this additional constraint needed to execute it, this issue should be of Low severity.
+
+Please correct me if I'm understanding something wrongly.
+
+**Arabadzhiew**
+
+@Czar102 There doesn't have to be a deployed pool at the given address. The goal of the exploit is to find a combination of the `basePool` and `underlying` values that results in an address that is equal to an EOA controlled by the malicious user. Then, that user will be able to call any one of the two callbacks through that EOA and steal the token allowances given to the router contract.
+
+**Czar102**
+
+@Arabadzhiew indeed, thank you for correcting me!
+
+I'm planning to reject the escalation and leave this a valid Medium severity issue.
+
+**Czar102**
+
+On second thoughts, @Arabadzhiew can you elaborate how much computation needs to be done having ~2^50 memory available?
+
+If an algorithm for finding this collision is not provided, I'm planning to invalidate this finding, similarly to findings that do not describe the algorithm in the future. (full feasibility analysis should have been done)
+
+**Arabadzhiew**
+
+Using the so-called "naive" collision finding algorithm, which is the one in question in all of the resources I have attached to my report requires at least 2^80 of storage available. And because that is an enormous amount as of today's standards, this is the biggest bottleneck of this exploit. What this essentially means is that with 2^50 of memory, the exploit will be practically impossible to execute using this algorithm.
+
+To show how much more computation will have to be made with this amount of memory, let's look at some math. I'm going to use the following formula to calculate the hash collision probabilities:
+
+$$ k^2 \over 2N $$
+
+Where **k** is the number of computed hashes and **N** is the total number of possible hashes (2^160 in our case).
+
+You can read more about it [here](https://preshing.com/20110504/hash-collision-probabilities/), but essentially, it is a very simplified version of a more complex hash collision probability formula, that works well with very big numbers. This is the least accurate formula from all of the mentioned ones in the article, but it is the only one that will return a probability value that is different from 0 with such a low **k** value being passed in to it.
+
+So for the scenario where we have 2^50 of memory available, we will first generate 2^50 public addresses, store those in our memory and then compute another set of 2^50 different pool addresses (by using different `basePool` and `underlying` values for each one). In that case, we will have **k = 2^51**. The output that we will get for this value from the above formula is the following: **1.7347235e-18** - a very small decimal value. This is our probability value between 0 and 1, where 0 = 0% probability and 1 = 100% probability. So to get how many times we will have to make 2^50 computations in order to have ~100% probability of collision, we have to divide 1 by that value. This results in the following value: **5.7646075e+17** which is exactly equal to 2^59. What we can derive from that is that to have approximately 100% probability of finding a collision in a 160 bit space, with only 2^50 of memory available, we will have to perform **2^50 * 2^59 = 2^109** computations. Obviously, this is a massive amount of computations. To put into perspective how big it actually is, if we had the full Bitcoin computation power at the hashrate of 7.68e20, it would take us **26797.9 years** to make this many computations.
+
+On the other hand though, if we had 2^80 of memory available, then the probability values will look completely differently. We will perform the exact same procedure as above, but this time we will generate two sets of 2^80 addresses. So our value of **k** will be equal to **2^81** this time around. And because that value is much bigger than 2^51, it allows us to use the other more accurate formulas. I will be using the following formula for this probability calculation, which is simply a more accurate version of the one used above:
+
+$$ 1 - e ^ {-k(k-1) \over 2N } $$
+
+The output that we get from that formula is **0.86466471676** which represents **~86.46%** chance of collision for the computation of 2^81 addresses. That is much better than than the previous example. And if we bump up our computations to 2^82, then we will get **0.99966453737** as an output, which represents **~99.96** chance of collision for that many computations. And for the sake of comparison, 2^81 computations can be performed in **0.87** hours by the Bitcoin network at the hashrate of 7.68e20 and 2^82 in **1.74** hours.
+
+On a final note, I'd like to mention once again that this is the simplest form of a hash collision finding algorithm, which does not make use of any memory saving optimizations. There are potential ways to bring down the amount of memory required for performing it, such as using bloom filters as mentioned in [this comment](https://github.com/sherlock-audit/2023-07-kyber-swap-judging/issues/90#issuecomment-1750097871) under the Kyberswap issue, so I'm sure that with time we will see more and more feasible implementations of that algorithm.
+
+@Czar102 I hope this clarifies things further.
+
+
+
+**Czar102**
+
+> On a final note, I'd like to mention once again that this is the simplest form of a hash collision finding algorithm, which does not make use of any memory saving optimizations. There are potential ways to bring down the amount of memory required for performing it, such as using bloom filters as mentioned in [this comment](https://github.com/sherlock-audit/2023-07-kyber-swap-judging/issues/90#issuecomment-1750097871) under the Kyberswap issue, so I'm sure that with time we will see more and more feasible implementations of that algorithm.
+
+Unless these optimizations are shared, I believe address collision to be a non-issue. Bloom filter can optimize storage down to 1 bit, but I don't think it's possible to go much further based on information-theoretic limitations: when a function $`f: \;\mathbb{B}^{20}\rightarrow \{ 0, 1\}`$ (describing whether a hash was already yielded) has at most $2^{2^{50}}$ configurations, the "expected value of information" about any random hash can't be larger than $2^{-110}$, even with fractional information (probabilistic approaches).
+
+Of course, my rough understanding may be wrong, so I'm open to having my mind changed. For now, this attack seems to be impossible to carry out. Hence, I'm planning to invalidate this finding.
+
+**midori-fuse**
+
+As the submitter of the same issue in Arcadia, this conversation has been quite helpful, and we'd like to share our thoughts.
+
+When we investigated the issue in Arcadia, we only really thought of the time complexity of $O(2^{N/2})$, which is possible, but not the memory complexity, which is indeed impossible as of now. The head of judging's question made us realize the additional constraint, and we apologize for not realizing it earlier during the Arcadia contest.
+
+However, as the head of judging stated himself in the Sherlock discord, I do believe the continuous development of available resources and what's at stake makes this issue worth mitigating. This is the kind of issue that's of critical impact if were to happen, and while it's impossible as of now, there's no telling *when* it will be possible in the future.
+
+Hence, while I believe this issue is true, I don't have opinions about its severity. What I would consider is what are the odds it becomes realistic in the lifetime of this protocol, not just at this current moment. 
+- In other words we're betting on how much can the storage problem can be solved, and how much funds are still at stake by then. This is also one of the discussion points from the Kyber issue.
+
+I do believe, however, that it's the responsibility of the issue author to outline the constraints related to the attack, and these kind of issues will likely need a revisit in the future given technological advancements.
+
+**Arabadzhiew**
+
+After doing some further research on the topic, I came across [this paper](https://hackmd.io/Vzhp5YJyTT-LhWm_s0JQpA), which describes a much more sophisticated collision finding algorithm. It requires 160 Terabytes (~2^47) of memory and 2^92 computations. Now, in my eyes, this looks like a much more feasible implementation. The number of computations is quite a bit higher, but it is still well within the realm of feasibility. Using the analogy that I've used above, the Bitcoin network will need ~0.2 years at the hashrate of 7.68e20 to make that many computations.
+
+The thing is, if someone decides to try and perform this exploit in the future, they won't be targeting a single protocol. They will be targeting as much protocols as they possibly can. So the more protocols there are with this vulnerability in them, the more likely it will be that this gets exploited. 
+
+**Czar102**
+
+> The thing is, if someone decides to try and perform this exploit in the future, they won't be targeting a single protocol. They will be targeting as much protocols as they possibly can. So the more protocols there are with this vulnerability in them, the more likely it will be that this gets exploited.
+
+I don't think that's true given the memory complexity of this attack.
+
+Nevertheless, the linked paper does present a way to optimize the memory complexity beyond the approach outlined in the previous comments.
+A large ($2^{11}$) multiplier in the above example is due to the increased difficulty of computing the elliptic point operations, which isn't needed in this attack – the attacker can simply deploy a wallet controlled by them using CREATE2.
+This will make the computational complexity of around $2^{81}$ and would require giga-terabytes of memory, which means this attack is possible to execute with ~34 minutes of the current Bitcoin's hashrate, assuming keccak256 is as easy to calculate as SHA-2. The current cost of this attack would be less than $1.5m with the current prices. This, of course, doesn't take into account the fact that keccak256 mining is a niche field, so the extent of cost optimization is much worse.
+
+I'd also like @midori-fuse to sign off on my reasoning – would you agree that it's possible to execute this attack?
+
+I think this finding was correctly judged as a Medium severity one.
+
+**midori-fuse**
+
+This is a really cool algorithm. Massive kudos to @Arabadzhiew for finding this paper. 
+
+Indeed that since we're looking for a contract-contract collision and not an EOA-contract collision, no EC multiplication is needed, making $f_1$ and $f_2$ purely keccak256 just with different inputs, and the cost of the attack is about $2^{81}$ calls to $f$ (which is, again, just keccak256).
+
+Since both functions are of the same weight now, we can set $m = \frac{1}{\theta} = 2^{40}$ and achieve the same execution time, but with $\sim 16$ times lower processor count and memory cost than outlined. Of course, the real attack time would take longer depending on how many parallel processes you have, but taking 0.02% of this power for 5000x the duration (while also lowering the memory cost by 5000x) and it's still not unrealistically long. The total number of hashing calls across all processors is the same, so the attack cost is the same as outlined. 
+
+Under the assumption that a standard computer can perform $2^{30}$ operations per second which is reasonable, @Czar102 's calculation is on point. Taking technological advancements into consideration, the computing power here does not have to be solely keccak256 mining, but also overall processor improvements as well.
+
+**nevillehuang**
+
+Maybe off topic and not relevant to finding but Curious why nobody tried to exploit uniswapv3
+
+**Czar102**
+
+@nevillehuang probably because you would need to create your own ASIC just for this (millions) or pay a quarter billion dollars for many, many GPU-hours.
+
+**nevillehuang**
+
+@Czar102 Surely its worth it for say a 400+ million USDC/ETH univ3 pool right?
+
+**Czar102**
+
+Result:
+Medium
+Unique
+
+
+**sherlock-admin4**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [nevillehuang](https://github.com/sherlock-audit/2024-01-napier-judging/issues/111/#issuecomment-1984957406): rejected
+
 # Issue M-13: SFrxETHAdapter redemptionQueue waiting period can DOS adapter functions 
 
 Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/120 
@@ -1634,7 +2292,7 @@ Source: https://github.com/sherlock-audit/2024-01-napier-judging/issues/120
 The protocol has acknowledged this issue.
 
 ## Found by 
-Falconhoof
+Falconhoof, mahdikarimi, xiaoming90
 ## Links
 https://github.com/FraxFinance/frax-ether-redemption-queue/blob/17ebebcddf31b7780e92c23a6b440dc789e5ceac/src/contracts/FraxEtherRedemptionQueue.sol#L417-L461
 https://github.com/FraxFinance/frax-ether-redemption-queue/blob/17ebebcddf31b7780e92c23a6b440dc789e5ceac/src/contracts/FraxEtherRedemptionQueue.sol#L235-L246
@@ -1716,4 +2374,140 @@ This will allow an immediate withdrawal for a fee of `0.5%`; see function [here]
 **massun-onibakuchi**
 
 We are aware of the situation. Therefore, we plan to set the TARGET BUFFER PERCENTAGE passively.
+
+**nevillehuang**
+
+Escalate, this is a duplicate of #89 given it shares the exact same root cause of depletion of eth buffer to cause dos in withdrawals
+
+**sherlock-admin2**
+
+> Escalate, this is a duplicate of #89 given it shares the exact same root cause of depletion of eth buffer to cause dos in withdrawals
+
+You've created a valid escalation!
+
+To remove the escalation from consideration: Delete your comment.
+
+You may delete or edit your escalation comment anytime before the 48-hour escalation window closes. After that, the escalation becomes final.
+
+**Qormatic**
+
+Malicious intent is not required for this to be an issue; which it will be as it will DOS user's ability to access funds for an extended period of time. 
+As noted in the issue; the withdrawal design aims to enable users withdraw their funds from Napier immediately without having to wait in the LST protocols withdrawal queue so this issue breaks the design of the protocol.
+> For redemptions; it allows users to redeem underlying without having to wait for any period of time.
+
+Further; as per Sherlock docs; a DOS can be considered valid if users funds are locked up for more than a week. Given that, in this case, users funds would be locked up for 15 days it more than meets that threshold.
+> Could Denial-of-Service (DOS), griefing, or locking of contracts count as a Medium (or High) issue? DoS has two separate scores on which it can become an issue:
+The issue causes locking of funds for users for more than a week.
+
+**nevillehuang**
+
+@Qormatic You are correct, adjusted my escalation.
+
+**massun-onibakuchi**
+
+@nevillehuang it is expected that most of users will basically withdraw after the maturity because redemption of principal token can be only allowed after the maturity. ( `redemptions` >> `deposits`: after the maturity.  `redemptions` << `deposits`: before the maturity. ). so, considering the redemption queue time, we're going to set targetBufferPercentage to higher one over time and before `bufferEth` derecase or 2 weeks before the the maturity, we will request withdrawal because our team knows it'd take 2 weeks to unstake ETH before this audit. The DoS can be caused by mismanagement. We believe that using waiting time as the basis for the claim does not reflect the actual situation.
+
+**massun-onibakuchi**
+
+> Malicious intent is not required for this to be an issue; which it will be as it will DOS user's ability to access funds for an extended period of time.
+
+I think this finding needs unlikely assumption. To borrow a phrase, this issue requires malicious intent.
+
+**Qormatic**
+
+@massun-onibakuchi I don't think it's an unlikely assumption that users would want to withdraw funds before maturity; else why would you provide them with zero wait functionality to do so?
+
+And the Admin team may have a plan to manage a best case scenario but the DOS vulnerability would be caused by user actions outside the admin team's control and would negatively impact other users by locking up their funds for an extended period of time.
+
+Also i dont think its fair post-contest to introduce additional context about off-chain withdrawl & buffer management which wasn't included in the README.
+
+**massun-onibakuchi**
+
+@Qormatic  why do you think it's not unlikely?
+From economical perspective, it is easily expected that above. Actually after the maturity deposits will be reverted by contract and only after the maturity, redemption of PT is allowed.
+
+`targetBufferPercentage` is state variable can be changed by `setTargetBufferPerecntage()`,  which intends the value can be adjusted properly after deployment.  That's why it has setter function and not immutable.
+
+**Qormatic**
+
+@massun-onibakuchi why can't user call redeemWithYT(); there's no expired modifier on it?
+
+**massun-onibakuchi**
+
+> @massun-onibakuchi why can't user call redeemWithYT(); there's no expired modifier on it?
+
+
+@Qormatic 
+This method requires users to holds the same amount of PT/YT. 
+
+**Banditx0x**
+
+This is clearly the design of the protocol. It is impossible to always be able to redeem all tokens from a protocol (like Napier) which stakes tokens into a staking protocol with a redemption queue/delay. 
+
+Napier is designed to reduce the likelihood of a withdrawal being delayed, but cannot permanantly remove it.
+
+**xiaoming9090**
+
+> @nevillehuang it is expected that most of users will basically withdraw after the maturity because redemption of principal token can be only allowed after the maturity. ( `redemptions` >> `deposits`: after the maturity. `redemptions` << `deposits`: before the maturity. ). so, considering the redemption queue time, we're going to set targetBufferPercentage to higher one over time and before `bufferEth` derecase or 2 weeks before the the maturity, we will request withdrawal because our team knows it'd take 2 weeks to unstake ETH before this audit. The DoS can be caused by mismanagement. We believe that using waiting time as the basis for the claim does not reflect the actual situation.
+
+The protocol is designed to allow users to withdraw both before and after maturity. Before maturity, users can withdraw via the `redeemWithYT` function. After maturity, the users can withdraw via the `redeem` or `withdraw` function. The report and its duplicate have shown that it is possible for malicious actors to DOS the user withdrawal, which is quite severe.
+
+The above measures do not fully mitigate the issue. If the maturity period is a year, the `targetBufferPercentage` will only be set to a high value when it is near maturity.
+
+Thus, the `targetBufferPercentage` has to be low at all other times during the one-year period. Otherwise, the protocol's core earning mechanism is broken. So, the malicious actor could still carry out the attack for the vast majority of the one-year period, resulting in users being unable to withdraw.
+
+The approach to fully mitigate this issue is documented in my report (https://github.com/sherlock-audit/2024-01-napier-judging/issues/89).
+
+**xiaoming9090**
+
+> This is clearly the design of the protocol. It is impossible to always be able to redeem all tokens from a protocol (like Napier) which stakes tokens into a staking protocol with a redemption queue/delay.
+> 
+> Napier is designed to reduce the likelihood of a withdrawal being delayed, but cannot permanantly remove it.
+
+If appropriate fees and restrictions had been put in place (See the recommendation section of https://github.com/sherlock-audit/2024-01-napier-judging/issues/89), this issue would not have occurred in the first place. Thus, this is not related to the design of the protocol.
+
+**xiaoming9090**
+
+> @massun-onibakuchi I don't think it's an unlikely assumption that users would want to withdraw funds before maturity; else why would you provide them with zero wait functionality to do so?
+> 
+> And the Admin team may have a plan to manage a best case scenario but the DOS vulnerability would be caused by user actions outside the admin team's control and would negatively impact other users by locking up their funds for an extended period of time.
+> 
+> Also i dont think its fair post-contest to introduce additional context about off-chain withdrawl & buffer management which wasn't included in the README.
+
+Agree with this. Note that this DOS issue, which is quite severe, is not documented under the list of known issues of the Contest's README. Thus, it would only be fair for Watson to flag this issue during the contest. Also, the mitigation mentioned by the sponsor cannot be applied retrospectively after the contest.
+
+**cvetanovv**
+
+I agree with @nevillehuang escalation. This issue can be a dup of 89. There I have left a comment on what I think of the report.
+
+**Czar102**
+
+I agree with the escalation. Planning to consider this a duplicate of #89.
+
+**Czar102**
+
+During the escalation period this issue was valid and #89 – invalid. Hence, the duplication of #89 <> #120 should be proposed on #89. There already was an escalation there that showed that the issue is valid, so there is only a single mistake made here – #89 is not a duplicate of #120, but invalid. Hence, one escalation should be accepted and it was the one on #89. This issue is not undergoing any changes.
+
+Hence, planning to apply the suggestion to duplicate these two, but also reject the escalation here.
+
+**nevillehuang**
+
+@Czar102 So this is a dupe of #89? Applying changes but reject escalation correct?
+
+**Czar102**
+
+Yes, I edited my comment to be clearer. Technically, will consider #89 to be a duplicate of this issue.
+
+**Czar102**
+
+Result:
+Medium
+Has duplicates
+
+**sherlock-admin3**
+
+Escalations have been resolved successfully!
+
+Escalation status:
+- [nevillehuang](https://github.com/sherlock-audit/2024-01-napier-judging/issues/120/#issuecomment-1984760548): rejected
 
